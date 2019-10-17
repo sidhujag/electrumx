@@ -816,6 +816,7 @@ class SessionBase(RPCSession):
         self.kind = kind  # 'RPC', 'TCP' etc.
         self.env = session_mgr.env
         self.coin = self.env.coin
+        MAX_CHUNK_SIZE = self.coin.CHUNK_SIZE
         self.client = 'unknown'
         self.anon_logs = self.env.anon_logs
         self.txs_sent = 0
@@ -1378,11 +1379,19 @@ class ElectrumX(SessionBase):
     async def compact_fee_histogram(self):
         self.bump_cost(1.0)
         return await self.mempool.compact_fee_histogram()
-
+    
+    async def asset_allocation_send(self, asset_guid, from_address, to_address, amount):
+        return await self.daemon_request('assetallocationsend', int(asset_guid), from_address, to_address, amount)
+    
+    async def address_list_assets(self, addresses):
+        # Note history is ordered but unconfirmed is unordered in e-s
+        return await self.daemon_request('listassetallocations', addresses)
+    
     def set_request_handlers(self, ptuple):
         self.protocol_tuple = ptuple
 
         handlers = {
+            'blockchain.address.list_assets': self.address_list_assets,
             'blockchain.block.header': self.block_header,
             'blockchain.block.headers': self.block_headers,
             'blockchain.estimatefee': self.estimatefee,
@@ -1405,6 +1414,7 @@ class ElectrumX(SessionBase):
             'server.peers.subscribe': self.peers_subscribe,
             'server.ping': self.ping,
             'server.version': self.server_version,
+            'asset.allocation.send': self.asset_allocation_send,
         }
 
         if ptuple >= (1, 4, 2):
@@ -1685,3 +1695,148 @@ class AuxPoWElectrumX(ElectrumX):
             height += 1
 
         return headers.hex()
+
+
+class SyscoinElectrumX(AuxPoWElectrumX):
+    '''A TCP server that handles incoming Electrum Syscoin connections.'''
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._mns = set()
+        self.mn_cache_height = 0
+        self.mn_cache = []
+    
+    def mns(self):
+        if self._mns is None:
+            self._mns = set()
+        return self._mns
+    
+    def set_request_handlers(self, ptuple):
+        super().set_request_handlers(ptuple)
+        self.request_handlers.update({
+                                     'masternode.announce.broadcast': self.masternode_announce_broadcast,
+                                     'masternode.subscribe': self.masternode_subscribe,
+                                     'masternode.list': self.masternode_list,
+                                     })
+    
+    async def notify(self, touched, height_changed):
+        '''Notify the client about changes in masternode list.'''
+        await super().notify(touched, height_changed)
+        for mn in self.mns().copy():
+            status = await self.daemon_request('masternode_list', ['status', mn])
+            await self.send_notification('masternode.subscribe', [mn, status.get(mn)])
+
+# Masternode command handlers
+async def masternode_announce_broadcast(self, signmnb):
+    '''Pass through the masternode announce message to be broadcast
+        by the daemon.
+        
+        signmnb: signed masternode broadcast message.'''
+            try:
+            return await self.daemon_request('masternode_broadcast', ['relay', signmnb])
+                except DaemonError as e:
+                    error, = e.args
+                        message = error['message']
+                        self.logger.info(f'masternode_broadcast: {message}')
+                        raise RPCError(BAD_REQUEST, 'the masternode broadcast was rejected.\n\n{message}\n[{signmnb}]')
+
+async def masternode_subscribe(self, collateral):
+    '''Returns the status of masternode.
+        
+        collateral: masternode collateral.
+        '''
+            result = await self.daemon_request('masternode_list',  ['status', collateral])
+            if result is not None:
+            self.mns().add(collateral)
+            return result.get(collateral)
+                return None
+
+async def masternode_list(self, payees):
+    '''
+        Returns the list of masternodes.
+        
+        payees: a list of masternode payee addresses.
+        '''
+            if not isinstance(payees, list):
+                raise RPCError(BAD_REQUEST, 'expected a list of payees')
+                    
+                    def get_masternode_payment_queue(mns):
+                        '''Returns the calculated position in the payment queue for all the
+                            valid masterernodes in the given mns list.
+                            
+                            mns: a list of masternodes information.
+                            '''
+                                now = int(datetime.datetime.utcnow().strftime("%s"))
+                                mn_queue = []
+                                
+                                # Only ENABLED masternodes are considered for the list.
+                                for line in mns:
+                                    mnstat = mns[line].split()
+                                    if mnstat[0] == 'ENABLED':
+                                        # if last paid time == 0
+                                        if int(mnstat[5]) == 0:
+                                            # use active seconds
+                                            mnstat.append(int(mnstat[4]))
+                                                else:
+                                                    # now minus last paid
+                                                    delta = now - int(mnstat[5])
+                                                    # if > active seconds, use active seconds
+                                                    if delta >= int(mnstat[4]):
+                                                        mnstat.append(int(mnstat[4]))
+                                                            # use active seconds
+                                                            else:
+                                                                mnstat.append(delta)
+                                                                    mn_queue.append(mnstat)
+                                                                        mn_queue = sorted(mn_queue, key=lambda x: x[8], reverse=True)
+                                                                        return mn_queue
+                                                                            
+                                                                            def get_payment_position(payment_queue, address):
+                                                                                '''
+                                                                                    Returns the position of the payment list for the given address.
+                                                                                    
+                                                                                    payment_queue: position in the payment queue for the masternode.
+                                                                                    address: masternode payee address.
+                                                                                    '''
+                                                                                        position = -1
+                                                                                            for pos, mn in enumerate(payment_queue, start=1):
+                                                                                                if mn[2] == address:
+                                                                                                    position = pos
+                                                                                                        break
+                                                                                                            return position
+                                                                                                                
+                                                                                                                # Accordingly with the masternode payment queue, a custom list
+                                                                                                                # with the masternode information including the payment
+                                                                                                                # position is returned.
+                                                                                                                cache = self.session_mgr.mn_cache
+                                                                                                                    if not cache or self.session_mgr.mn_cache_height != self.db.db_height:
+                                                                                                                        full_mn_list = await self.daemon_request('masternode_list', ['full'])
+                                                                                                                        mn_payment_queue = get_masternode_payment_queue(full_mn_list)
+                                                                                                                        mn_payment_count = len(mn_payment_queue)
+                                                                                                                        mn_list = []
+                                                                                                                        for key, value in full_mn_list.items():
+                                                                                                                            mn_data = value.split()
+                                                                                                                            mn_info = {}
+                                                                                                                                mn_info['vin'] = key
+                                                                                                                                mn_info['status'] = mn_data[0]
+                                                                                                                                mn_info['protocol'] = mn_data[1]
+                                                                                                                                mn_info['payee'] = mn_data[2]
+                                                                                                                                mn_info['lastseen'] = mn_data[3]
+                                                                                                                                mn_info['activeseconds'] = mn_data[4]
+                                                                                                                                mn_info['lastpaidtime'] = mn_data[5]
+                                                                                                                                mn_info['lastpaidblock'] = mn_data[6]
+                                                                                                                                mn_info['ip'] = mn_data[7]
+                                                                                                                                mn_info['paymentposition'] = get_payment_position(mn_payment_queue, mn_info['payee'])
+                                                                                                                                mn_info['inselection'] = ( mn_info['paymentposition'] < mn_payment_count // 10)
+                                                                                                                                hashX = self.coin.address_to_hashX(mn_info['payee'])
+                                                                                                                                balance = await self.get_balance(hashX)
+                                                                                                                                mn_info['balance'] = (sum(balance.values()) / self.coin.VALUE_PER_COIN)
+                                                                                                                                mn_list.append(mn_info)
+                                                                                                                                    cache.clear()
+                                                                                                                                    cache.extend(mn_list)
+                                                                                                                                    self.session_mgr.mn_cache_height = self.db.db_height
+                                                                                                                                        
+                                                                                                                                        # If payees is an empty list the whole masternode list is returned
+                                                                                                                                        if payees:
+                                                                                                                                            return [mn for mn in cache if mn['payee'] in payees]
+                                                                                                                                                else:
+                                                                                                                                                    return cache
