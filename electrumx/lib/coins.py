@@ -3324,7 +3324,7 @@ class Syscoin(AuxPowMixin, Coin):
 
     PEER_DEFAULT_PORTS = {'t': '58881', 's': '58882'}
     PEERS = [
-             '104.248.3.80 s t',
+             '127.0.0.1 s t',
              ]
         
      
